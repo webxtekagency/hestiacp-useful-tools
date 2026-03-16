@@ -106,6 +106,7 @@ sudo -n exim -Mvh [MESSAGE_ID]
 ```bash
 sudo -n exim -Mvb [MESSAGE_ID]
 ```
+*(CRITICAL: NEVER invent or hallucinate the body of an email. If you cannot read it with this command, state that it is unavailable. Do NOT create fake marketing emails or responses.)*
 
 **View Delivery Log (Why is it stuck?):**
 ```bash
