@@ -1,18 +1,17 @@
 require('dotenv').config();
 const { Telegraf } = require('telegraf');
 const axios = require('axios');
+const dns = require('dns');
 
-// 1. Strict Environment Variables Check (No Hardcoded Values)
 const { TELEGRAM_BOT_TOKEN, DIFY_API_URL, DIFY_API_KEY } = process.env;
 const IS_CHATFLOW = process.env.IS_CHATFLOW === 'true';
 
 if (!TELEGRAM_BOT_TOKEN || !DIFY_API_URL || !DIFY_API_KEY) {
   console.error("❌ ERROR: Missing required environment variables!");
-  console.error("Please ensure TELEGRAM_BOT_TOKEN, DIFY_API_URL, and DIFY_API_KEY are set in CapRover or your .env file.");
+  console.error("Please ensure TELEGRAM_BOT_TOKEN, DIFY_API_URL, and DIFY_API_KEY are set.");
   process.exit(1);
 }
 
-// Helper to escape HTML special characters
 function escapeHtml(text) {
   if (!text) return text;
   return text
@@ -21,7 +20,6 @@ function escapeHtml(text) {
     .replace(/>/g, "&gt;");
 }
 
-// Helper to format text for Telegram HTML (Smarter & Cleaner)
 function formatTelegramMessage(text) {
   if (!text) return "";
 
@@ -50,7 +48,6 @@ function formatTelegramMessage(text) {
 
     formatted = formatted
       .replace(/^#{1,6}\s+/gm, '')
-      // Restore blockquote support using HTML tag which Telegram supports
       .replace(/^>\s?(.*)$/gm, '<blockquote>$1</blockquote>')
       .replace(/\*\*([^\n*][\s\S]*?[^\n*])\*\*/g, '<b>$1</b>')
       .replace(/__([^\n_]+)__/g, '<b>$1</b>')
@@ -61,18 +58,15 @@ function formatTelegramMessage(text) {
   }).join('');
 }
 
-// Helper to split and send long messages
 async function sendLongMessage(ctx, text) {
   const MAX_LENGTH = 4000;
   
-  // Helper to send safely
   const sendChunk = async (chunk) => {
     try {
       const html = formatTelegramMessage(chunk);
       await ctx.reply(html, { parse_mode: 'HTML', disable_web_page_preview: true });
     } catch (e) {
       console.warn("[WARN] HTML send failed, retrying plain text:", e.message);
-      // Fallback: strip tags or just send raw
       await ctx.reply(chunk); 
     }
   };
@@ -100,24 +94,19 @@ async function sendLongMessage(ctx, text) {
   }
 }
 
-// 2. Initialize Telegram Bot
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
-
 const userConversations = {};
 
-// 3. Setup Bot Commmands & Middleware
 bot.start((ctx) => {
   const chatId = ctx.from.id;
   delete userConversations[chatId];
   ctx.reply("🤖 Hello! I am connected to the Dify DevOps System. How can I help you regarding your HestiaCP server today?");
 });
 
-// Help command
 bot.help((ctx) => {
   ctx.reply("Send me any message or alert, and I will forward it to the AI DevOps Agent for analysis.");
 });
 
-  // Main message handler
 bot.on('text', async (ctx) => {
   const chatId = ctx.from.id;
   const userText = ctx.message.text;
@@ -127,7 +116,8 @@ bot.on('text', async (ctx) => {
   
   let statusMessageId = null;
   let currentThought = "🔄 Connecting to Agent...";
-  let lastThought = "";
+  let lastSentText = "";
+  let fullAnswer = "";
 
   try {
     const sentMsg = await ctx.reply(currentThought);
@@ -140,29 +130,75 @@ bot.on('text', async (ctx) => {
     ctx.sendChatAction('typing').catch(() => {});
   }, 4000);
 
-  // Update status message every 1.5 seconds if changed (faster feedback)
   const statusUpdateInterval = setInterval(async () => {
-    if (statusMessageId && currentThought !== lastThought) {
-      lastThought = currentThought;
+    let formattedText = formatTelegramMessage(fullAnswer);
+    let textToSend = formattedText;
+    
+    if (currentThought && !fullAnswer) {
+      textToSend = `<i>${currentThought}</i>`;
+    } else if (currentThought && fullAnswer) {
+      textToSend = `<i>${currentThought}</i>\n\n${formattedText}`;
+    } else if (!currentThought && !fullAnswer) {
+      textToSend = "🔄 Processing...";
+    }
+
+    if (textToSend.length > 4000) {
+      textToSend = textToSend.substring(0, 4000) + "\n\n⏳ [Loading long response...]";
+    }
+
+    if (statusMessageId && textToSend !== lastSentText) {
+      const textToCompare = textToSend;
       try {
-        await ctx.telegram.editMessageText(chatId, statusMessageId, null, currentThought);
+        await ctx.telegram.editMessageText(chatId, statusMessageId, null, textToSend, { 
+          parse_mode: 'HTML',
+          disable_web_page_preview: true
+        });
+        lastSentText = textToCompare;
       } catch (e) {
-        // Ignore errors (e.g. message not modified or too frequent)
+        try {
+          let plainText = textToSend.replace(/<\/?i>/g, '').replace(/<[^>]+>/g, '');
+          await ctx.telegram.editMessageText(chatId, statusMessageId, null, plainText, {
+            disable_web_page_preview: true
+          });
+          lastSentText = textToCompare;
+        } catch (e2) {}
       }
     }
   }, 1500);
 
   try {
-    // API Endpoint differs slightly between Agent and Chatflow/Workflow
-    // Agent: /chat-messages
-    // Workflow: /chat-messages (usually same for Chatflow apps, but response format differs)
-    // Workflow (Pure): /workflows/run (we assume Chatflow App here)
-    const targetUrl = `${DIFY_API_URL}/chat-messages`;
+    let targetUrl = `${DIFY_API_URL}/chat-messages`;
+    let requestHeaders = {
+        'Authorization': `Bearer ${DIFY_API_KEY}`,
+        'Content-Type': 'application/json'
+    };
+
+    try {
+        dns.setServers(['8.8.8.8', '1.1.1.1']);
+        const urlObj = new URL(DIFY_API_URL);
+        const hostname = urlObj.hostname;
+        
+        console.log(`[DNS-DEBUG] Attempting manual resolution for ${hostname}...`);
+        
+        const resolveIp = () => new Promise((resolve, reject) => {
+            dns.resolve4(hostname, (err, addresses) => {
+                if (err) reject(err);
+                else resolve(addresses[0]);
+            });
+        });
+
+        const ip = await resolveIp();
+        console.log(`[DNS-DEBUG] Manually resolved ${hostname} to ${ip}`);
+        
+        targetUrl = targetUrl.replace(hostname, ip);
+        requestHeaders['Host'] = hostname;
+        
+    } catch (e) {
+        console.error(`[DNS-DEBUG] Manual DNS resolution failed: ${e.message}. Falling back to system DNS.`);
+    }
     
     console.log(`[DEBUG] Requesting Dify (Streaming Mode) at: ${targetUrl} | Mode: ${IS_CHATFLOW ? 'Chatflow' : 'Agent'}`);
     
-    // We leave inputs empty because the user relies on hardcoded prompt values
-    // for compatibility between Telegram and Dify Native Web Chat.
     const difyPayload = {
       inputs: {},
       query: userText,
@@ -175,22 +211,29 @@ bot.on('text', async (ctx) => {
     }
 
     const response = await axios.post(targetUrl, difyPayload, {
-      headers: {
-        'Authorization': `Bearer ${DIFY_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
+      headers: requestHeaders,
       responseType: 'stream',
-      timeout: 1200000 // 20 minutes timeout to allow extremely long Agent executions (DeepSeek/GPT-4o)
+      timeout: 1200000
     });
 
-    let fullAnswer = "";
     let conversationId = "";
     let buffer = "";
+    
+    let streamIdleTimeout;
+    const resetIdleTimeout = () => {
+        clearTimeout(streamIdleTimeout);
+        streamIdleTimeout = setTimeout(() => {
+            console.error("[IDLE TIMEOUT] No response from Dify in 60 seconds. Forcing stream closure.");
+            response.data.destroy(new Error("Idle Timeout - No data received for 60 seconds"));
+        }, 60000);
+    };
+
+    resetIdleTimeout();
 
     response.data.on('data', (chunk) => {
+      resetIdleTimeout();
       buffer += chunk.toString();
       let lines = buffer.split('\n');
-      // Keep the last line in the buffer as it might be incomplete
       buffer = lines.pop();
 
       for (const line of lines) {
@@ -199,25 +242,20 @@ bot.on('text', async (ctx) => {
         try {
           const data = JSON.parse(line.substring(5));
           
-          // Capture agent thoughts/observations (Standard Agent Mode)
           if (!IS_CHATFLOW && data.event === 'agent_thought') {
             if (data.thought) {
-              // Truncate thought to avoid huge messages and format beautifully
               const cleanThought = data.thought.replace(/\n/g, ' ').trim();
               const thoughtPreview = cleanThought.length > 100 ? cleanThought.substring(0, 100) + "..." : cleanThought;
               currentThought = `💭 Thinking: ${thoughtPreview}`;
             } else if (data.tool) {
-               // Show tool usage clearly
                currentThought = `🛠️ Using tool: ${data.tool}...`;
             } else if (data.observation) {
                currentThought = `👀 Analyzing command result...`;
             }
           }
           
-          // Capture Chatflow/Workflow node steps (Workflow Mode)
           if (IS_CHATFLOW && (data.event === 'node_started' || data.event === 'workflow_started')) {
             const nodeTitle = data.data?.title || data.data?.node_type || "Processing...";
-            // Don't show "Start" or "Answer" nodes as they are boring
             if (nodeTitle !== 'Start' && nodeTitle !== 'Answer' && nodeTitle !== 'User Input') {
                 currentThought = `⏳ Step: ${nodeTitle}...`;
             }
@@ -232,17 +270,15 @@ bot.on('text', async (ctx) => {
           if (data.event === 'error') {
             console.error("[DIFY-STREAM-ERROR]", data.message);
           }
-        } catch (e) {
-          // Ignore partial JSON chunks
-        }
+        } catch (e) {}
       }
     });
 
     response.data.on('end', async () => {
+      clearTimeout(streamIdleTimeout);
       clearInterval(typingInterval);
       clearInterval(statusUpdateInterval);
 
-      // Delete the status message before sending final answer
       if (statusMessageId) {
         try {
             await ctx.telegram.deleteMessage(chatId, statusMessageId);
@@ -254,12 +290,17 @@ bot.on('text', async (ctx) => {
       if (conversationId) userConversations[chatId] = conversationId;
       
       if (fullAnswer.trim()) {
-        // Send final response
         await sendLongMessage(ctx, fullAnswer);
       } else {
         console.warn("[WARN] Dify stream ended with empty answer.");
-        await ctx.reply("⚠️ Cloud Dify processed the request but returned an empty answer. Please check your IF/ELSE logic and Answer nodes.");
+        await ctx.reply("⚠️ Cloud Dify processed the request but returned an empty answer.");
       }
+    });
+
+    // Capture the destroyed stream error manually if needed
+    response.data.on('error', (err) => {
+        clearTimeout(streamIdleTimeout);
+        console.error("Stream Explicit Error:", err.message);
     });
 
   } catch (error) {
@@ -269,17 +310,12 @@ bot.on('text', async (ctx) => {
         try { await ctx.telegram.deleteMessage(chatId, statusMessageId); } catch(e){}
     }
     
-    // Enhanced Error Logging for Debugging
     if (error.response) {
         console.error(`[ERROR] Dify API Response Status:`, error.response.status);
-        // Fix: error.response.data might be a stream in axios stream mode, or circular.
-        // Try to read stream if possible, or just log safely.
         try {
            if (error.response.data && typeof error.response.data.read === 'function') {
-               // It's a stream, try to read it
                error.response.data.on('data', d => console.error(`[ERROR BODY]: ${d.toString()}`));
            } else {
-               // It's likely an object or string
                console.error(`[ERROR] Dify API Response Data:`, JSON.stringify(error.response.data));
            }
         } catch(serializationError) {
@@ -293,11 +329,9 @@ bot.on('text', async (ctx) => {
   }
 });
 
-// 4. Start the Bot
 bot.launch().then(() => {
   console.log("🚀 Telegram-Dify Node.js Bridge is running!");
 });
 
-// Enable graceful stop
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
